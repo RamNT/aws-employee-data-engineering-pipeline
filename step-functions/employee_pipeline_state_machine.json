@@ -1,0 +1,657 @@
+{
+  "Comment": "A description of my state machine",
+  "StartAt": "InitializeExecution",
+  "States": {
+    "InitializeExecution": {
+      "Type": "Pass",
+      "Next": "CreateAuditRunning",
+      "Parameters": {
+        "run_type.$": "$.run_type",
+        "batch_id.$": "$.batch_id",
+        "batch_run_timestamp.$": "$.batch_run_timestamp",
+        "batch_year.$": "$.batch_year",
+        "batch_month.$": "$.batch_month",
+        "batch_day.$": "$.batch_day",
+        "pipeline_name": "employee_pipeline"
+      }
+    },
+    "CreateAuditRunning": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "TableName": "employee_pipeline_audit",
+        "Item": {
+          "batch_id": {
+            "S.$": "$.batch_id"
+          },
+          "pipeline_name": {
+            "S.$": "$.pipeline_name"
+          },
+          "run_type": {
+            "S.$": "$.run_type"
+          },
+          "status": {
+            "S": "RUNNING"
+          },
+          "start_timestamp": {
+            "S.$": "$.batch_run_timestamp"
+          }
+        }
+      },
+      "ResultPath": null,
+      "Next": "CheckRunType"
+    },
+    "CheckRunType": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Next": "SetHistoricalPath",
+          "Variable": "$.run_type",
+          "StringMatches": "HISTORICAL"
+        },
+        {
+          "Next": "SetIncrementalPath",
+          "Variable": "$.run_type",
+          "StringMatches": "INCREMENTAL"
+        }
+      ],
+      "Default": "InvalidRunType"
+    },
+    "InvalidRunType": {
+      "Type": "Pass",
+      "Next": "UpdateAuditFailed",
+      "Parameters": {
+        "run_type.$": "$.run_type",
+        "batch_id.$": "$.batch_id",
+        "batch_run_timestamp.$": "$.batch_run_timestamp",
+        "pipeline_name.$": "$.pipeline_name",
+        "failed_step": "RunTypeValidation",
+        "failure_reason": "run_type must be HISTORICAL or INCREMENTAL"
+      }
+    },
+    "UpdateAuditFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "employee_pipeline_audit",
+        "Key": {
+          "batch_id": {
+            "S.$": "$.batch_id"
+          }
+        },
+        "UpdateExpression": "SET #st = :status, end_timestamp = :end_ts, failure_step = :step, failure_reason = :reason",
+        "ExpressionAttributeNames": {
+          "#st": "status"
+        },
+        "ExpressionAttributeValues": {
+          ":status": {
+            "S": "FAILED"
+          },
+          ":end_ts": {
+            "S.$": "$$.State.EnteredTime"
+          },
+          ":step": {
+            "S.$": "$.failed_step"
+          },
+          ":reason": {
+            "S.$": "$.failure_reason"
+          }
+        }
+      },
+      "ResultPath": null,
+      "Next": "PrepareFailureEmail"
+    },
+    "PrepareFailureEmail": {
+      "Type": "Pass",
+      "Parameters": {
+        "run_type.$": "$.run_type",
+        "batch_id.$": "$.batch_id",
+        "batch_run_timestamp.$": "$.batch_run_timestamp",
+        "pipeline_name.$": "$.pipeline_name",
+        "failed_step.$": "$.failed_step",
+        "failure_reason.$": "$.failure_reason",
+        "email_subject.$": "States.Format('Employee Pipeline FAILED - {}', $.batch_id)",
+        "email_body.$": "States.Format('Employee Data Pipeline failed. Run Type: {} | Batch ID: {} | Failed Step: {} | Reason: {} | Watermark Updated: NO', $.run_type, $.batch_id, $.failed_step, $.failure_reason)"
+      },
+      "Next": "SendFailureEmail"
+    },
+    "SendFailureEmail": {
+      "Type": "Task",
+      "Parameters": {
+        "Source": "<VERIFIED_SES_EMAIL>",
+        "Destination": {
+          "ToAddresses": [
+            "<VERIFIED_SES_EMAIL>"
+          ]
+        },
+        "Message": {
+          "Subject": {
+            "Data.$": "$.email_subject",
+            "Charset": "UTF-8"
+          },
+          "Body": {
+            "Text": {
+              "Data.$": "$.email_body",
+              "Charset": "UTF-8"
+            }
+          }
+        }
+      },
+      "Resource": "arn:aws:states:::aws-sdk:ses:sendEmail",
+      "ResultPath": null,
+      "Next": "PipelineFailed"
+    },
+    "PipelineFailed": {
+      "Type": "Fail"
+    },
+    "SetHistoricalPath": {
+      "Type": "Pass",
+      "Parameters": {
+        "run_type.$": "$.run_type",
+        "batch_id.$": "$.batch_id",
+        "batch_run_timestamp.$": "$.batch_run_timestamp",
+        "batch_year.$": "$.batch_year",
+        "batch_month.$": "$.batch_month",
+        "batch_day.$": "$.batch_day",
+        "pipeline_name.$": "$.pipeline_name",
+        "bronze_path": "s3://de-employee-dev-source/bronze/employee/historical/",
+        "silver_base_path": "s3://de-employee-dev-source/silver/employee/"
+      },
+      "Next": "StartBronzeCrawler"
+    },
+    "StartBronzeCrawler": {
+      "Type": "Task",
+      "Parameters": {
+        "Name": "project_employee_bronze_crawler"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+      "ResultPath": null,
+      "Next": "WaitForBronzeCrawler"
+    },
+    "WaitForBronzeCrawler": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "GetBronzeCrawlerStatus"
+    },
+    "GetBronzeCrawlerStatus": {
+      "Type": "Task",
+      "Parameters": {
+        "Name": "project_employee_bronze_crawler"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+      "ResultPath": "$.bronze_crawler",
+      "Next": "CheckBronzeCrawlerStatus"
+    },
+    "CheckBronzeCrawlerStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Next": "RunBronzeToSilver",
+          "Variable": "$.bronze_crawler.Crawler.State",
+          "StringMatches": "READY"
+        },
+        {
+          "Next": "WaitForBronzeCrawler",
+          "Variable": "$.bronze_crawler.Crawler.State",
+          "StringMatches": "RUNNING"
+        },
+        {
+          "Next": "WaitForBronzeCrawler",
+          "Variable": "$.bronze_crawler.Crawler.State",
+          "StringMatches": "STOPPING"
+        }
+      ],
+      "Default": "BronzeCrawlerFailed"
+    },
+    "BronzeCrawlerFailed": {
+      "Type": "Pass",
+      "Parameters": {
+        "run_type.$": "$.run_type",
+        "batch_id.$": "$.batch_id",
+        "batch_run_timestamp.$": "$.batch_run_timestamp",
+        "pipeline_name.$": "$.pipeline_name",
+        "failed_step": "BronzeCrawler",
+        "failure_reason": "Bronze crawler returned an unexpected state"
+      },
+      "Next": "UpdateAuditFailed"
+    },
+    "RunBronzeToSilver": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "project_employee_bronze_to_silver_prod",
+        "Arguments": {
+          "--run_type.$": "$.run_type",
+          "--batch_id.$": "$.batch_id",
+          "--batch_run_timestamp.$": "$.batch_run_timestamp",
+          "--bronze_path.$": "$.bronze_path",
+          "--silver_base_path.$": "$.silver_base_path",
+          "--batch_year.$": "$.batch_year",
+          "--batch_month.$": "$.batch_month",
+          "--batch_day.$": "$.batch_day"
+        }
+      },
+      "ResultPath": null,
+      "Next": "StartSilverCrawler"
+    },
+    "StartSilverCrawler": {
+      "Type": "Task",
+      "Parameters": {
+        "Name": "project_employee_silver_crawler"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+      "ResultPath": null,
+      "Next": "WaitForSilverCrawler"
+    },
+    "WaitForSilverCrawler": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "GetSilverCrawlerStatus"
+    },
+    "GetSilverCrawlerStatus": {
+      "Type": "Task",
+      "Parameters": {
+        "Name": "project_employee_silver_crawler"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+      "ResultPath": "$.silver_crawler",
+      "Next": "CheckSilverCrawlerStatus"
+    },
+    "CheckSilverCrawlerStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Next": "RunSilverToRedshift_stage",
+          "Variable": "$.silver_crawler.Crawler.State",
+          "StringMatches": "READY"
+        },
+        {
+          "Next": "WaitForSilverCrawler",
+          "Variable": "$.silver_crawler.Crawler.State",
+          "StringMatches": "RUNNING"
+        },
+        {
+          "Next": "WaitForSilverCrawler",
+          "Variable": "$.silver_crawler.Crawler.State",
+          "StringMatches": "STOPPING"
+        }
+      ],
+      "Default": "SilverCrawlerFailed"
+    },
+    "SilverCrawlerFailed": {
+      "Type": "Pass",
+      "Parameters": {
+        "run_type.$": "$.run_type",
+        "batch_id.$": "$.batch_id",
+        "batch_run_timestamp.$": "$.batch_run_timestamp",
+        "pipeline_name.$": "$.pipeline_name",
+        "failed_step": "SilverCrawler",
+        "failure_reason": "Silver crawler returned an unexpected state"
+      },
+      "Next": "UpdateAuditFailed"
+    },
+    "RunSilverToRedshift_stage": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "project_employee_silver_to_redshift_prod",
+        "Arguments": {
+          "--run_type.$": "$.run_type",
+          "--batch_id.$": "$.batch_id",
+          "--batch_run_timestamp.$": "$.batch_run_timestamp",
+          "--silver_base_path.$": "$.silver_base_path",
+          "--batch_year.$": "$.batch_year",
+          "--batch_month.$": "$.batch_month",
+          "--batch_day.$": "$.batch_day"
+        }
+      },
+      "ResultPath": null,
+      "Next": "ExecuteEmployeeSCD2"
+    },
+    "ExecuteEmployeeSCD2": {
+      "Type": "Task",
+      "Parameters": {
+        "WorkgroupName": "cloud-de-wrkgrp-redshift",
+        "Database": "dev",
+        "Sql.$": "States.Format('CALL curated.sp_load_employee_scd2(\\'{}\\', TIMESTAMP \\'{}\\');', $.run_type, $.batch_run_timestamp)"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
+      "ResultPath": "$.scd2_execution",
+      "Next": "WaitForEmployeeSCD2"
+    },
+    "WaitForEmployeeSCD2": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "GetEmployeeSCD2Status"
+    },
+    "GetEmployeeSCD2Status": {
+      "Type": "Task",
+      "Parameters": {
+        "Id.$": "$.scd2_execution.Id"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+      "ResultPath": "$.scd2_status",
+      "Next": "CheckEmployeeSCD2Status"
+    },
+    "CheckEmployeeSCD2Status": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Next": "RunGoldDQ",
+          "Variable": "$.scd2_status.Status",
+          "StringMatches": "FINISHED"
+        },
+        {
+          "Next": "WaitForEmployeeSCD2",
+          "Variable": "$.scd2_status.Status",
+          "StringMatches": "SUBMITTED"
+        },
+        {
+          "Next": "WaitForEmployeeSCD2",
+          "Variable": "$.scd2_status.Status",
+          "StringMatches": "PICKED"
+        },
+        {
+          "Next": "WaitForEmployeeSCD2",
+          "Variable": "$.scd2_status.Status",
+          "StringMatches": "STARTED"
+        },
+        {
+          "Next": "EmployeeSCD2Failed",
+          "Variable": "$.scd2_status.Status",
+          "StringMatches": "ABORTED"
+        }
+      ],
+      "Default": "EmployeeSCD2Failed"
+    },
+    "EmployeeSCD2Failed": {
+      "Type": "Pass",
+      "Parameters": {
+        "run_type.$": "$.run_type",
+        "batch_id.$": "$.batch_id",
+        "batch_run_timestamp.$": "$.batch_run_timestamp",
+        "pipeline_name.$": "$.pipeline_name",
+        "failed_step": "EmployeeSCD2",
+        "failure_reason": "Redshift employee SCD2 processing failed"
+      },
+      "Next": "UpdateAuditFailed"
+    },
+    "RunGoldDQ": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "project-employee-gold-dq",
+        "Payload": {
+          "run_type.$": "$.run_type",
+          "batch_id.$": "$.batch_id"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "ResultPath": "$.dq_invoke",
+      "Next": "CheckDQStatus"
+    },
+    "CheckDQStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Next": "ExecuteGetNewWatermark",
+          "Variable": "$.dq_invoke.Payload.dq_status",
+          "StringMatches": "PASS"
+        },
+        {
+          "Next": "DQFailed",
+          "Variable": "$.dq_invoke.Payload.dq_status",
+          "StringMatches": "FAIL"
+        }
+      ],
+      "Default": "DQFailed"
+    },
+    "DQFailed": {
+      "Type": "Pass",
+      "Parameters": {
+        "run_type.$": "$.run_type",
+        "batch_id.$": "$.batch_id",
+        "batch_run_timestamp.$": "$.batch_run_timestamp",
+        "pipeline_name.$": "$.pipeline_name",
+        "failed_step": "GoldDQ",
+        "failure_reason": "Curated employee data quality checks returned FAIL"
+      },
+      "Next": "UpdateAuditFailed"
+    },
+    "ExecuteGetNewWatermark": {
+      "Type": "Task",
+      "Parameters": {
+        "WorkgroupName": "cloud-de-wrkgrp-redshift",
+        "Database": "dev",
+        "Sql": "SELECT MAX(updated_at)::VARCHAR AS new_watermark FROM staging.stg_employee;"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
+      "ResultPath": "$.watermark_execution",
+      "Next": "WaitForWatermarkQuery"
+    },
+    "WaitForWatermarkQuery": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "GetWatermarkQueryStatus"
+    },
+    "GetWatermarkQueryStatus": {
+      "Type": "Task",
+      "Parameters": {
+        "Id.$": "$.watermark_execution.Id"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+      "ResultPath": "$.watermark_status",
+      "Next": "CheckWatermarkQueryStatus"
+    },
+    "CheckWatermarkQueryStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Next": "WaitForWatermarkQuery",
+          "Variable": "$.watermark_status.Status",
+          "StringMatches": "SUBMITTED"
+        },
+        {
+          "Next": "WaitForWatermarkQuery",
+          "Variable": "$.watermark_status.Status",
+          "StringMatches": "PICKED"
+        },
+        {
+          "Next": "WaitForWatermarkQuery",
+          "Variable": "$.watermark_status.Status",
+          "StringMatches": "STARTED"
+        },
+        {
+          "Next": "WatermarkQueryFailed",
+          "Variable": "$.watermark_status.Status",
+          "StringMatches": "FAILED"
+        },
+        {
+          "Next": "WatermarkQueryFailed",
+          "Variable": "$.watermark_status.Status",
+          "StringMatches": "ABORTED"
+        },
+        {
+          "Next": "GetWatermarkResult",
+          "Variable": "$.watermark_status.Status",
+          "StringMatches": "FINISHED"
+        }
+      ],
+      "Default": "WatermarkQueryFailed"
+    },
+    "WatermarkQueryFailed": {
+      "Type": "Pass",
+      "Parameters": {
+        "run_type.$": "$.run_type",
+        "batch_id.$": "$.batch_id",
+        "batch_run_timestamp.$": "$.batch_run_timestamp",
+        "pipeline_name.$": "$.pipeline_name",
+        "failed_step": "WatermarkQuery",
+        "failure_reason": "Redshift watermark query failed"
+      },
+      "Next": "UpdateAuditFailed"
+    },
+    "SetIncrementalPath": {
+      "Type": "Pass",
+      "Parameters": {
+        "run_type.$": "$.run_type",
+        "batch_id.$": "$.batch_id",
+        "batch_run_timestamp.$": "$.batch_run_timestamp",
+        "batch_year.$": "$.batch_year",
+        "batch_month.$": "$.batch_month",
+        "batch_day.$": "$.batch_day",
+        "pipeline_name.$": "$.pipeline_name",
+        "bronze_path": "s3://de-employee-dev-source/bronze/employee/incremental/",
+        "silver_base_path": "s3://de-employee-dev-source/silver/employee/"
+      },
+      "Next": "StartBronzeCrawler"
+    },
+    "GetWatermarkResult": {
+      "Type": "Task",
+      "Parameters": {
+        "Id.$": "$.watermark_execution.Id"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:getStatementResult",
+      "ResultPath": "$.watermark_result",
+      "Next": "PrepareWatermark"
+    },
+    "PrepareWatermark": {
+      "Type": "Pass",
+      "Parameters": {
+        "run_type.$": "$.run_type",
+        "batch_id.$": "$.batch_id",
+        "batch_run_timestamp.$": "$.batch_run_timestamp",
+        "batch_year.$": "$.batch_year",
+        "batch_month.$": "$.batch_month",
+        "batch_day.$": "$.batch_day",
+        "pipeline_name.$": "$.pipeline_name",
+        "bronze_path.$": "$.bronze_path",
+        "silver_base_path.$": "$.silver_base_path",
+        "dq_invoke.$": "$.dq_invoke",
+        "new_watermark.$": "$.watermark_result.Records[0][0].StringValue"
+      },
+      "Next": "UpdateEmployeeWatermark"
+    },
+    "UpdateEmployeeWatermark": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "employee_watermark",
+        "Key": {
+          "table_name": {
+            "S": "employee"
+          }
+        },
+        "UpdateExpression": "SET watermark_column = :wc, last_success_watermark = :wm, last_batch_id = :bid, last_run_type = :rt, updated_timestamp = :uts",
+        "ExpressionAttributeValues": {
+          ":wc": {
+            "S": "updated_at"
+          },
+          ":wm": {
+            "S.$": "$.new_watermark"
+          },
+          ":bid": {
+            "S.$": "$.batch_id"
+          },
+          ":rt": {
+            "S.$": "$.run_type"
+          },
+          ":uts": {
+            "S.$": "$.batch_run_timestamp"
+          }
+        }
+      },
+      "ResultPath": null,
+      "Next": "UpdateAuditSuccess"
+    },
+    "UpdateAuditSuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "employee_pipeline_audit",
+        "Key": {
+          "batch_id": {
+            "S.$": "$.batch_id"
+          }
+        },
+        "UpdateExpression": "SET #st = :status, end_timestamp = :end_ts, dq_status = :dq, target_watermark = :wm",
+        "ExpressionAttributeNames": {
+          "#st": "status"
+        },
+        "ExpressionAttributeValues": {
+          ":status": {
+            "S": "SUCCESS"
+          },
+          ":end_ts": {
+            "S.$": "$$.State.EnteredTime"
+          },
+          ":dq": {
+            "S.$": "$.dq_invoke.Payload.dq_status"
+          },
+          ":wm": {
+            "S.$": "$.new_watermark"
+          }
+        }
+      },
+      "ResultPath": null,
+      "Next": "PrepareSuccessEmail"
+    },
+    "PrepareSuccessEmail": {
+      "Type": "Pass",
+      "Next": "SendSuccessEmail",
+      "Parameters": {
+        "run_type.$": "$.run_type",
+        "batch_id.$": "$.batch_id",
+        "batch_run_timestamp.$": "$.batch_run_timestamp",
+        "pipeline_name.$": "$.pipeline_name",
+        "new_watermark.$": "$.new_watermark",
+        "dq_invoke.$": "$.dq_invoke",
+        "email_subject.$": "States.Format('Employee Pipeline SUCCESS - {}', $.batch_id)",
+        "email_body.$": "States.Format('Employee Data Pipeline completed successfully. Run Type: {} | Batch ID: {} | DQ Status: {} | New Watermark: {}', $.run_type, $.batch_id, $.dq_invoke.Payload.dq_status, $.new_watermark)"
+      }
+    },
+    "SendSuccessEmail": {
+      "Type": "Task",
+      "Parameters": {
+        "Source": "<VERIFIED_SES_EMAIL>",
+        "Destination": {
+          "ToAddresses": [
+            "<VERIFIED_SES_EMAIL>"
+          ]
+        },
+        "Message": {
+          "Subject": {
+            "Data.$": "$.email_subject",
+            "Charset": "UTF-8"
+          },
+          "Body": {
+            "Text": {
+              "Data.$": "$.email_body",
+              "Charset": "UTF-8"
+            }
+          }
+        }
+      },
+      "Resource": "arn:aws:states:::aws-sdk:ses:sendEmail",
+      "ResultPath": null,
+      "Next": "PipelineSucceeded"
+    },
+    "PipelineSucceeded": {
+      "Type": "Succeed"
+    }
+  },
+  "QueryLanguage": "JSONPath"
+}
